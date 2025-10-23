@@ -1,183 +1,81 @@
-import os
-import io
-import traceback
-import numpy as np
-from fastapi import FastAPI, File, UploadFile, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, LargeBinary, Float
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from insightface.app import FaceAnalysis
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel
+from typing import Optional
 from PIL import Image
-import uvicorn
-import logging
+import io, requests, numpy as np
+from sqlalchemy.orm import Session
+from models import FaceEmbedding  # your SQLAlchemy model
+from database import SessionLocal  # your DB session
+from face_utils import get_embedding  # your face embedding function
 
-# ---------------------------------------
-# ✅ Logging setup
-# ---------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("face_api")
+app = FastAPI()
 
-# ---------------------------------------
-# ✅ App setup
-# ---------------------------------------
-app = FastAPI(title="Face Clustering API", version="1.1")
+# Pydantic schema for URL-based input
+class ImageInput(BaseModel):
+    image_url: Optional[str] = None
 
-# Enable CORS for testing with Colab or n8n
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # you can restrict this later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------------------------------------
-# ✅ Database setup
-# ---------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable not set")
-
-try:
-    engine = create_engine(DATABASE_URL)
-    SessionLocal = sessionmaker(bind=engine)
-    Base = declarative_base()
-except Exception as e:
-    logger.error(f"❌ Database connection failed: {e}")
-    raise
-
-class FaceEmbedding(Base):
-    __tablename__ = "face_embeddings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    face_id = Column(String, index=True)
-    embedding = Column(LargeBinary)
-    image_url = Column(String)
-    similarity = Column(Float)
-
-Base.metadata.create_all(bind=engine)
-
-# ---------------------------------------
-# ✅ Face model init
-# ---------------------------------------
-try:
-    logger.info("Initializing FaceAnalysis model (buffalo_l)...")
-    app_insight = FaceAnalysis(name="buffalo_l")
-    app_insight.prepare(ctx_id=-1, det_size=(640, 640))  # use CPU
-    logger.info("✅ Face model loaded successfully.")
-except Exception as e:
-    logger.error(f"❌ Face model failed to load: {e}")
-    raise
-
-# ---------------------------------------
-# ✅ Utility functions
-# ---------------------------------------
-def get_embedding(image: Image.Image):
-    try:
-        arr = np.array(image)
-        faces = app_insight.get(arr)
-        if not faces:
-            return None
-        return faces[0].embedding.astype(np.float32)
-    except Exception as e:
-        logger.error(f"❌ Embedding extraction error: {e}")
-        raise
-
-def cosine_similarity(a, b):
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-
-# ---------------------------------------
-# ✅ Global error handler
-# ---------------------------------------
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    tb = traceback.format_exc()
-    logger.error(f"Unhandled exception at {request.url}:\n{tb}")
-    return JSONResponse(
-        status_code=500,
-        content={
-            "status": "error",
-            "error_type": exc.__class__.__name__,
-            "message": str(exc),
-            "trace": tb.splitlines()[-5:],  # last few lines for context
-            "hint": "Check Railway logs for full trace or verify inputs.",
-        },
-    )
-
-# ---------------------------------------
-# ✅ Routes
-# ---------------------------------------
-@app.get("/")
-def home():
-    return {"message": "Face Clustering API is running"}
 
 @app.post("/process-face")
-async def process_face(file: UploadFile = File(...)):
-    logger.info(f"📸 Received file: {file.filename}")
+async def process_face(
+    file: Optional[UploadFile] = File(None),
+    data: Optional[ImageInput] = None
+):
+    """
+    Accepts either:
+    1. Multipart upload with a file
+    2. JSON body with { "image_url": "https://..." }
+    """
+
+    image_bytes = None
+
+    # Case 1: Direct file upload
+    if file is not None:
+        image_bytes = await file.read()
+
+    # Case 2: Remote image URL
+    elif data and data.image_url:
+        try:
+            resp = requests.get(data.image_url, timeout=10)
+            resp.raise_for_status()
+            image_bytes = resp.content
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to fetch image: {e}")
+
+    else:
+        raise HTTPException(status_code=422, detail="Field required: file or image_url")
+
+    # ---- Process Image ----
     try:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        embedding = get_embedding(image)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-        if embedding is None:
-            return JSONResponse(
-                content={
-                    "status": "error",
-                    "message": "No face detected in image",
-                    "hint": "Ensure the image contains a clear, front-facing face."
-                },
-                status_code=400,
-            )
+    # Extract embedding
+    embedding = get_embedding(image)
+    if not isinstance(embedding, np.ndarray):
+        embedding = np.array(embedding)
 
-        session = SessionLocal()
-        embeddings = session.query(FaceEmbedding).all()
+    embedding = embedding.astype(float).tolist()
 
-        best_match = None
-        best_score = 0.0
-        for e in embeddings:
-            existing_emb = np.frombuffer(e.embedding, dtype=np.float32)
-            sim = cosine_similarity(embedding, existing_emb)
-            if sim > best_score:
-                best_score = sim
-                best_match = e
-
-        THRESHOLD = 0.6
-        face_id = best_match.face_id if best_match and best_score >= THRESHOLD else f"face_{len(embeddings)+1}"
-
-        new_entry = FaceEmbedding(
-            face_id=face_id,
-            embedding=embedding.tobytes(),
-            image_url=file.filename,
-            similarity=float(best_score),
-        )
-        session.add(new_entry)
+    # ---- Store in Database ----
+    session: Session = SessionLocal()
+    try:
+        face_entry = FaceEmbedding(embedding=embedding)
+        session.add(face_entry)
         session.commit()
+        session.refresh(face_entry)
+        face_id = face_entry.id
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
         session.close()
 
-        logger.info(f"✅ Processed {file.filename} | face_id={face_id} | similarity={best_score:.3f}")
-
-        return {
-            "status": "success",
-            "face_id": face_id,
-            "similarity": float(best_score),
-            "message": "Processed successfully",
-        }
-
-    except Exception as e:
-        tb = traceback.format_exc()
-        logger.error(f"❌ Error processing {file.filename}:\n{tb}")
-        return JSONResponse(
-            status_code=500,
-            content={
-                "status": "error",
-                "error_type": e.__class__.__name__,
-                "message": str(e),
-                "trace": tb.splitlines()[-5:],
-                "hint": "Check if the uploaded file is a valid image.",
-            },
-        )
+    # ---- Return Response ----
+    return {
+        "message": "Face processed successfully",
+        "face_id": face_id,
+    }
 
 # ---------------------------------------
 # ✅ Entry point
