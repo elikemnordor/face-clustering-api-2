@@ -1,22 +1,44 @@
+import os
 import io
 import base64
+import traceback
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, UploadFile, Request, Form
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from PIL import Image
-import face_recognition
 from sqlalchemy import create_engine, Column, Integer, String, LargeBinary, Float
-from sqlalchemy.orm import sessionmaker, declarative_base
-import uuid
-import os
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from insightface.app import FaceAnalysis
+from PIL import Image
+import uvicorn
+import logging
 
-# ----------------------------
-# DATABASE SETUP
-# ----------------------------
+# ---------------------------------------
+# ✅ Logging setup
+# ---------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("face_api")
+
+# ---------------------------------------
+# ✅ App setup
+# ---------------------------------------
+app = FastAPI(title="Face Clustering API", version="2.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------
+# ✅ Database setup
+# ---------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable not set")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -26,96 +48,121 @@ class FaceEmbedding(Base):
     __tablename__ = "face_embeddings"
     id = Column(Integer, primary_key=True, index=True)
     face_id = Column(String, index=True)
-    embedding = Column(LargeBinary)  # Store embedding bytes
-    similarity = Column(Float, default=1.0)
-    image_url = Column(String, nullable=True)
+    embedding = Column(LargeBinary)
+    image_url = Column(String)
+    similarity = Column(Float)
 
 Base.metadata.create_all(bind=engine)
 
-# ----------------------------
-# FASTAPI APP
-# ----------------------------
-app = FastAPI(title="Face Clustering API (Base64-ready)")
+# ---------------------------------------
+# ✅ Face model init
+# ---------------------------------------
+logger.info("Initializing FaceAnalysis model (buffalo_l)...")
+app_insight = FaceAnalysis(name="buffalo_l")
+app_insight.prepare(ctx_id=-1, det_size=(640, 640))  # CPU mode
+logger.info("✅ Face model loaded successfully.")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ---------------------------------------
+# ✅ Helpers
+# ---------------------------------------
+def get_embedding(image: Image.Image):
+    arr = np.array(image)
+    faces = app_insight.get(arr)
+    if not faces:
+        return None
+    return faces[0].embedding.astype(np.float32)
 
-# ----------------------------
-# REQUEST MODEL
-# ----------------------------
-class FaceRequest(BaseModel):
-    image_base64: str  # base64 string of an image
+def cosine_similarity(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-def get_face_embedding(image: Image.Image):
-    """Extract 128-d face embedding from a PIL Image."""
-    rgb_image = np.array(image.convert("RGB"))
-    face_locations = face_recognition.face_locations(rgb_image)
-    if not face_locations:
-        raise ValueError("No face detected in the image.")
-    encodings = face_recognition.face_encodings(rgb_image, face_locations)
-    if not encodings:
-        raise ValueError("Failed to encode face.")
-    return encodings[0]
+# ---------------------------------------
+# ✅ Routes
+# ---------------------------------------
+@app.get("/")
+def home():
+    return {"message": "Face Clustering API v2 is running"}
 
-def calculate_similarity(embedding1, embedding2):
-    """Cosine similarity between two embeddings."""
-    dot = np.dot(embedding1, embedding2)
-    norm1 = np.linalg.norm(embedding1)
-    norm2 = np.linalg.norm(embedding2)
-    return float(dot / (norm1 * norm2))
-
-# ----------------------------
-# MAIN ENDPOINT
-# ----------------------------
 @app.post("/process-face")
-def process_face(request: FaceRequest):
+async def process_face(
+    file: UploadFile = None,
+    image_base64: str = Form(default=None)
+):
     try:
-        # Decode Base64 image
-        image_data = base64.b64decode(request.image_base64.split(",")[-1])
-        image = Image.open(io.BytesIO(image_data))
-
-        # Extract embedding
-        embedding = get_face_embedding(image)
-        embedding_bytes = embedding.astype(np.float32).tobytes()
-
-        db = SessionLocal()
-        faces = db.query(FaceEmbedding).all()
-
-        # Compare with existing embeddings
-        match_face_id = None
-        highest_similarity = 0.0
-        for face in faces:
-            existing = np.frombuffer(face.embedding, dtype=np.float32)
-            sim = calculate_similarity(existing, embedding)
-            if sim > 0.6 and sim > highest_similarity:
-                highest_similarity = sim
-                match_face_id = face.face_id
-
-        # Create or reuse face_id
-        if match_face_id:
-            face_id = match_face_id
+        # Read image input
+        if file:
+            logger.info(f"📸 Received file upload: {file.filename}")
+            contents = await file.read()
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
+        elif image_base64:
+            logger.info("📸 Received Base64 image")
+            image_data = base64.b64decode(image_base64)
+            image = Image.open(io.BytesIO(image_data)).convert("RGB")
         else:
-            face_id = str(uuid.uuid4())
-            db.add(FaceEmbedding(face_id=face_id, embedding=embedding_bytes))
+            return JSONResponse(
+                content={"status": "error", "message": "No image provided"},
+                status_code=400
+            )
 
-        db.commit()
-        db.close()
+        embedding = get_embedding(image)
+        if embedding is None:
+            return JSONResponse(
+                content={"status": "error", "message": "No face detected"},
+                status_code=400
+            )
+
+        session = SessionLocal()
+        embeddings = session.query(FaceEmbedding).all()
+
+        best_match = None
+        best_score = 0.0
+        for e in embeddings:
+            existing_emb = np.frombuffer(e.embedding, dtype=np.float32)
+            sim = cosine_similarity(embedding, existing_emb)
+            if sim > best_score:
+                best_score = sim
+                best_match = e
+
+        THRESHOLD = 0.6
+        face_id = (
+            best_match.face_id if best_match and best_score >= THRESHOLD
+            else f"face_{len(embeddings)+1}"
+        )
+
+        new_entry = FaceEmbedding(
+            face_id=face_id,
+            embedding=embedding.tobytes(),
+            image_url=file.filename if file else "base64_upload",
+            similarity=float(best_score),
+        )
+        session.add(new_entry)
+        session.commit()
+        session.close()
+
+        logger.info(f"✅ Processed face_id={face_id} | similarity={best_score:.3f}")
 
         return {
             "status": "success",
             "face_id": face_id,
-            "match": bool(match_face_id),
-            "similarity": highest_similarity
+            "similarity": float(best_score),
+            "message": "Processed successfully",
         }
 
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        tb = traceback.format_exc()
+        logger.error(f"❌ Error:\n{tb}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "error",
+                "error_type": e.__class__.__name__,
+                "message": str(e),
+                "trace": tb.splitlines()[-5:],
+            },
+        )
+
+# ---------------------------------------
+# ✅ Entry point
+# ---------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
